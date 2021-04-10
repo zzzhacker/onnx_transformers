@@ -93,30 +93,79 @@ def create_model_for_provider(model_path: str, provider: str) -> InferenceSessio
     return session
 
 
-def get_framework(model=None):
+# def get_framework(model=None):
+#     """
+#     Select framework (TensorFlow or PyTorch) to use.
+
+#     Args:
+#         model (:obj:`str`, :class:`~transformers.PreTrainedModel` or :class:`~transformers.TFPreTrainedModel`, `optional`):
+#             If both frameworks are installed, picks the one corresponding to the model passed (either a model class or
+#             the model name). If no specific model is provided, defaults to using PyTorch.
+#     """
+#     if is_tf_available() and is_torch_available() and model is not None and not isinstance(model, str):
+#         # Both framework are available but the user supplied a model class instance.
+#         # Try to guess which framework to use from the model classname
+#         framework = "tf" if model.__class__.__name__.startswith("TF") else "pt"
+#     elif not is_tf_available() and not is_torch_available():
+#         raise RuntimeError(
+#             "At least one of TensorFlow 2.0 or PyTorch should be installed. "
+#             "To install TensorFlow 2.0, read the instructions at https://www.tensorflow.org/install/ "
+#             "To install PyTorch, read the instructions at https://pytorch.org/."
+#         )
+#     else:
+#         # framework = 'tf' if is_tf_available() else 'pt'
+#         framework = "pt" if is_torch_available() else "tf"
+#     return framework
+
+def infer_framework_from_model(
+    model, model_classes: Optional[Dict[str, type]] = None, revision: Optional[str] = None, task: Optional[str] = None
+):
     """
-    Select framework (TensorFlow or PyTorch) to use.
+    Select framework (TensorFlow or PyTorch) to use from the :obj:`model` passed. Returns a tuple (framework, model).
+
+    If :obj:`model` is instantiated, this function will just infer the framework from the model class. Otherwise
+    :obj:`model` is actually a checkpoint name and this method will try to instantiate it using :obj:`model_classes`.
+    Since we don't want to instantiate the model twice, this model is returned for use by the pipeline.
+
+    If both frameworks are installed and available for :obj:`model`, PyTorch is selected.
 
     Args:
-        model (:obj:`str`, :class:`~transformers.PreTrainedModel` or :class:`~transformers.TFPreTrainedModel`, `optional`):
-            If both frameworks are installed, picks the one corresponding to the model passed (either a model class or
-            the model name). If no specific model is provided, defaults to using PyTorch.
+        model (:obj:`str`, :class:`~transformers.PreTrainedModel` or :class:`~transformers.TFPreTrainedModel`):
+            The model to infer the framework from. If :obj:`str`, a checkpoint name. The model to infer the framewrok
+            from.
+        model_classes (dictionary :obj:`str` to :obj:`type`, `optional`):
+            A mapping framework to class.
+        revision (:obj:`str`, `optional`):
+            The specific model version to use. It can be a branch name, a tag name, or a commit id, since we use a
+            git-based system for storing models and other artifacts on huggingface.co, so ``revision`` can be any
+            identifier allowed by git.
+
+    Returns:
+        :obj:`Tuple`: A tuple framework, model.
     """
-    if is_tf_available() and is_torch_available() and model is not None and not isinstance(model, str):
-        # Both framework are available but the user supplied a model class instance.
-        # Try to guess which framework to use from the model classname
-        framework = "tf" if model.__class__.__name__.startswith("TF") else "pt"
-    elif not is_tf_available() and not is_torch_available():
+    if not is_tf_available() and not is_torch_available():
         raise RuntimeError(
             "At least one of TensorFlow 2.0 or PyTorch should be installed. "
             "To install TensorFlow 2.0, read the instructions at https://www.tensorflow.org/install/ "
             "To install PyTorch, read the instructions at https://pytorch.org/."
         )
-    else:
-        # framework = 'tf' if is_tf_available() else 'pt'
-        framework = "pt" if is_torch_available() else "tf"
-    return framework
+    if isinstance(model, str):
+        if is_torch_available() and not is_tf_available():
+            model_class = model_classes.get("pt", AutoModel)
+            model = model_class.from_pretrained(model, revision=revision, _from_pipeline=task)
+        elif is_tf_available() and not is_torch_available():
+            model_class = model_classes.get("tf", TFAutoModel)
+            model = model_class.from_pretrained(model, revision=revision, _from_pipeline=task)
+        else:
+            try:
+                model_class = model_classes.get("pt", AutoModel)
+                model = model_class.from_pretrained(model, revision=revision, _from_pipeline=task)
+            except OSError:
+                model_class = model_classes.get("tf", TFAutoModel)
+                model = model_class.from_pretrained(model, revision=revision, _from_pipeline=task)
 
+    framework = "tf" if model.__class__.__name__.startswith("TF") else "pt"
+    return framework, model
 
 class PipelineException(Exception):
     """
