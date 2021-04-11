@@ -1,0 +1,5 @@
+{
+    "python.pythonPath": "/home/yogesh/anaconda3/envs/Openmind/bin/python",
+    "python.linting.pylintEnabled": true,
+    "python.linting.enabled": true
+}
