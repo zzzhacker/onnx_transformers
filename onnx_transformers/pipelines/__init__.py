@@ -18,11 +18,15 @@
 # limitations under the License.
 import warnings
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
+import os
+from pathlib import Path
+from psutil import cpu_count
 
 from transformers.configuration_utils import PretrainedConfig
 from transformers.file_utils import is_tf_available, is_torch_available
 from transformers.modelcard import ModelCard
 from transformers.models.auto.tokenization_auto import AutoTokenizer
+from transformers.models.auto.configuration_auto import AutoConfig
 from transformers.tokenization_utils import PreTrainedTokenizer
 from transformers.utils import logging
 from .base import (
@@ -89,8 +93,16 @@ if TYPE_CHECKING:
     from transformers.modeling_tf_utils import TFPreTrainedModel
     from transformers.modeling_utils import PreTrainedModel
 
+ONNX_CACHE_DIR = Path(os.path.dirname(__file__)).parent.joinpath(".onnx")
+
 logger = logging.get_logger(__name__)
 
+
+
+# Constants from the performance optimization available in onnxruntime
+# It needs to be done before importing onnxruntime
+os.environ["OMP_NUM_THREADS"] = str(cpu_count(logical=True))
+os.environ["OMP_WAIT_POLICY"] = "ACTIVE"
 
 # Register all the supported tasks here
 SUPPORTED_TASKS = {
@@ -362,9 +374,19 @@ def pipeline(
     elif isinstance(config, str):
         modelcard = config
 
+    
+    # Instantiate config
+    if config is not None and isinstance(config, str):
+        config = AutoConfig.from_pretrained(config,revision=revision, _from_pipeline=task)
+    elif config is None:
+        config = AutoConfig.from_pretrained(model,revision=revision, _from_pipeline=task)
+
+    graph_name = f"{os.path.basename(model)}.onnx"
+    graph_path = ONNX_CACHE_DIR.joinpath(model, graph_name)
+
     # Infer the framework form the model
     if framework is None:
-        framework, model = infer_framework_from_model(model, targeted_task, revision=revision, task=task)
+        framework, model = infer_framework_from_model(model, targeted_task, revision=revision, task=task,onnx=onnx,graph_path=graph_path)
 
     task_class, model_class = targeted_task["impl"], targeted_task[framework]
 
@@ -381,47 +403,41 @@ def pipeline(
                 tokenizer, revision=revision, use_fast=use_fast, _from_pipeline=task
             )
 
-    # Instantiate config if needed
-    if isinstance(config, str):
-        config = AutoConfig.from_pretrained(config, revision=revision, _from_pipeline=task)
-
-    # Instantiate modelcard if needed
-    if isinstance(modelcard, str):
-        modelcard = ModelCard.from_pretrained(modelcard, revision=revision, _from_pipeline=task)
-
+    
     # Instantiate model if needed
-    if isinstance(model, str):
-        # Handle transparent TF/PT model conversion
-        if framework == "pt" and model.endswith(".h5"):
-            model_kwargs["from_tf"] = True
-            logger.warning(
-                "Model might be a TensorFlow model (ending with `.h5`) but TensorFlow is not available. "
-                "Trying to load the model with PyTorch."
-            )
-        elif framework == "tf" and model.endswith(".bin"):
-            model_kwargs["from_pt"] = True
-            logger.warning(
-                "Model might be a PyTorch model (ending with `.bin`) but PyTorch is not available. "
-                "Trying to load the model with Tensorflow."
-            )
-
-        if model_class is None:
-            raise ValueError(
-                f"Pipeline using {framework} framework, but this framework is not supported by this pipeline."
-            )
-
-        model = model_class.from_pretrained(
-            model, config=config, revision=revision, _from_pipeline=task, **model_kwargs
-        )
-
-    if task == "translation" and model.config.task_specific_params:
-        for key in model.config.task_specific_params:
-            if key.startswith("translation"):
-                task = key
-                warnings.warn(
-                    f'"translation" task was used, instead of "translation_XX_to_YY", defaulting to "{task}"',
-                    UserWarning,
+    if (onnx and not os.path.exists(graph_path)) or not onnx:
+        if isinstance(model, str):
+            # Handle transparent TF/PT model conversion
+            if framework == "pt" and model.endswith(".h5"):
+                model_kwargs["from_tf"] = True
+                logger.warning(
+                    "Model might be a TensorFlow model (ending with `.h5`) but TensorFlow is not available. "
+                    "Trying to load the model with PyTorch."
                 )
-                break
+            elif framework == "tf" and model.endswith(".bin"):
+                model_kwargs["from_pt"] = True
+                logger.warning(
+                    "Model might be a PyTorch model (ending with `.bin`) but PyTorch is not available. "
+                    "Trying to load the model with Tensorflow."
+                )
 
-    return task_class(model=model, tokenizer=tokenizer, modelcard=modelcard, framework=framework, task=task, **kwargs)
+            if model_class is None:
+                raise ValueError(
+                    f"Pipeline using {framework} framework, but this framework is not supported by this pipeline."
+                )
+
+            model = model_class.from_pretrained(
+                model, config=config, revision=revision, _from_pipeline=task, **model_kwargs
+            )
+
+        if task == "translation" and model.config.task_specific_params:
+            for key in model.config.task_specific_params:
+                if key.startswith("translation"):
+                    task = key
+                    warnings.warn(
+                        f'"translation" task was used, instead of "translation_XX_to_YY", defaulting to "{task}"',
+                        UserWarning,
+                    )
+                    break
+
+    return task_class(model=model, tokenizer=tokenizer,config=config, modelcard=modelcard, framework=framework, task=task, onnx=onnx,graph_path=graph_path,**kwargs)

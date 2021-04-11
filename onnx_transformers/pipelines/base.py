@@ -18,14 +18,18 @@ import os
 import pickle
 import sys
 import warnings
+from pathlib import Path
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from os.path import abspath, exists
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+from onnxruntime import GraphOptimizationLevel, InferenceSession, SessionOptions, get_all_providers
 from transformers.file_utils import add_end_docstrings, is_tf_available, is_torch_available
+from transformers.convert_graph_to_onnx import convert_pytorch, convert_tensorflow, infer_shapes
 from transformers.modelcard import ModelCard
 from transformers.tokenization_utils import PreTrainedTokenizer, TruncationStrategy
+from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
 
@@ -46,10 +50,9 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
-
 def infer_framework_from_model(
-    model, model_classes: Optional[Dict[str, type]] = None, revision: Optional[str] = None, task: Optional[str] = None
-):
+    model, model_classes: Optional[Dict[str, type]] = None, revision: Optional[str] = None, task: Optional[str] = None,
+    onnx: bool = True,graph_path: Optional[Path] = None):
     """
     Select framework (TensorFlow or PyTorch) to use from the :obj:`model` passed. Returns a tuple (framework, model).
 
@@ -79,23 +82,41 @@ def infer_framework_from_model(
             "To install TensorFlow 2.0, read the instructions at https://www.tensorflow.org/install/ "
             "To install PyTorch, read the instructions at https://pytorch.org/."
         )
-    if isinstance(model, str):
-        if is_torch_available() and not is_tf_available():
-            model_class = model_classes.get("pt", AutoModel)
-            model = model_class.from_pretrained(model, revision=revision, _from_pipeline=task)
-        elif is_tf_available() and not is_torch_available():
-            model_class = model_classes.get("tf", TFAutoModel)
-            model = model_class.from_pretrained(model, revision=revision, _from_pipeline=task)
-        else:
-            try:
+    if (onnx and not os.path.exists(graph_path)) or not onnx:
+        if isinstance(model, str):
+            if is_torch_available() and not is_tf_available():
                 model_class = model_classes.get("pt", AutoModel)
                 model = model_class.from_pretrained(model, revision=revision, _from_pipeline=task)
-            except OSError:
+            elif is_tf_available() and not is_torch_available():
                 model_class = model_classes.get("tf", TFAutoModel)
                 model = model_class.from_pretrained(model, revision=revision, _from_pipeline=task)
+            else:
+                try:
+                    model_class = model_classes.get("pt", AutoModel)
+                    model = model_class.from_pretrained(model, revision=revision, _from_pipeline=task)
+                except OSError:
+                    model_class = model_classes.get("tf", TFAutoModel)
+                    model = model_class.from_pretrained(model, revision=revision, _from_pipeline=task)
+            framework = "tf" if model.__class__.__name__.startswith("TF") else "pt"
+    else:
+        framework = "pt" if is_torch_available() else "tf"
 
-    framework = "tf" if model.__class__.__name__.startswith("TF") else "pt"
     return framework, model
+
+def create_model_for_provider(model_path: str, provider: str) -> InferenceSession:
+
+    assert provider in get_all_providers(), f"provider {provider} not found, {get_all_providers()}"
+
+    # Few properties that might have an impact on performances (provided by MS)
+    options = SessionOptions()
+    options.intra_op_num_threads = 1
+    options.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
+
+    # Load the model as a graph and prepare the CPU backend
+    session = InferenceSession(model_path, options, providers=[provider])
+    session.disable_fallback()
+
+    return session
 
 
 def get_framework(model, revision: Optional[str] = None):
@@ -520,6 +541,7 @@ class Pipeline(_ScikitCompat):
     def __init__(
         self,
         model: Union["PreTrainedModel", "TFPreTrainedModel"],
+        config: PretrainedConfig,
         tokenizer: PreTrainedTokenizer,
         modelcard: Optional[ModelCard] = None,
         framework: Optional[str] = None,
@@ -527,6 +549,8 @@ class Pipeline(_ScikitCompat):
         args_parser: ArgumentHandler = None,
         device: int = -1,
         binary_output: bool = False,
+        onnx: bool = True,
+        graph_path: Optional[Path] = None,
     ):
 
         if framework is None:
@@ -535,19 +559,33 @@ class Pipeline(_ScikitCompat):
         self.task = task
         self.model = model
         self.tokenizer = tokenizer
+        self.config = config
         self.modelcard = modelcard
         self.framework = framework
         self.device = device if framework == "tf" else torch.device("cpu" if device < 0 else f"cuda:{device}")
         self.binary_output = binary_output
+        self.onnx = onnx
+        self.graph_path = graph_path
 
         # Special handling
-        if self.framework == "pt" and self.device.type == "cuda":
+        if self.framework == "pt" and self.device.type == "cuda" and (not onnx):
             self.model = self.model.to(self.device)
 
+        if onnx:
+            input_names_path = graph_path.parent.joinpath(f"{os.path.basename(graph_path)}.input_names.json")
+            if not graph_path.exists() or not input_names_path.exists():
+                self._export_onnx_graph(input_names_path)
+
+            logger.info(f"loading onnx graph from {self.graph_path.as_posix()}")
+            self.onnx_model = create_model_for_provider(str(graph_path), "CPUExecutionProvider")
+            self.input_names = json.load(open(input_names_path))
+            self.framework = "np"
+            self._warup_onnx_graph()
+
         # Update config with task specific parameters
-        task_specific_params = self.model.config.task_specific_params
-        if task_specific_params is not None and task in task_specific_params:
-            self.model.config.update(task_specific_params.get(task))
+        # task_specific_params = self.model.config.task_specific_params
+        # if task_specific_params is not None and task in task_specific_params:
+        #     self.model.config.update(task_specific_params.get(task))
 
     def save_pretrained(self, save_directory: str):
         """
@@ -626,6 +664,8 @@ class Pipeline(_ScikitCompat):
         """
         if not isinstance(supported_models, list):  # Create from a model mapping
             supported_models = [item[1].__name__ for item in supported_models.items()]
+        print(self.model.__class__.__name__)
+        print(supported_models)
         if self.model.__class__.__name__ not in supported_models:
             raise PipelineException(
                 self.task,
@@ -652,7 +692,11 @@ class Pipeline(_ScikitCompat):
 
     def __call__(self, *args, **kwargs):
         inputs = self._parse_and_tokenize(*args, **kwargs)
-        return self._forward(inputs)
+        if self.onnx:
+            print('onnx forward')
+            return self._forward_onnx(inputs)
+        else:
+            return self._forward(inputs)
 
     def _forward(self, inputs, return_tensors=False):
         """
@@ -679,3 +723,37 @@ class Pipeline(_ScikitCompat):
             return predictions
         else:
             return predictions.numpy()
+    def _export_onnx_graph(self, input_names_path: Path):
+        # if graph exists, but we are here then it means something went wrong in previous load
+        # so delete old graph
+        if self.graph_path.exists():
+            self.graph_path.unlink()
+        if input_names_path.exists():
+            input_names_path.unlink()
+
+        # create parent dir
+        if not self.graph_path.parent.exists():
+            os.makedirs(self.graph_path.parent.as_posix())
+       
+        logger.info(f"Saving onnx graph at { self.graph_path.as_posix()}")
+
+        if self.framework == "pt":
+            convert_pytorch(self, opset=11, output=self.graph_path, use_external_format=False)
+        else:
+            convert_tensorflow(self, opset=11, output=self.graph_path)
+
+        # save input names
+        self.input_names = infer_shapes(self, "pt")[0]
+        with open(input_names_path, "w") as f:
+            json.dump(self.input_names, f)
+
+    def _forward_onnx(self, inputs, return_tensors=False):
+        # inputs_onnx = {k: v.cpu().detach().numpy() for k, v in inputs.items() if k in self.input_names}
+        inputs_onnx = {k: v for k, v in inputs.items() if k in self.input_names}
+        predictions = self.onnx_model.run(None, inputs_onnx)
+        return predictions
+
+    def _warup_onnx_graph(self, n=10):
+        model_inputs = self.tokenizer("My name is Bert", return_tensors="np")
+        for _ in range(n):
+            self._forward_onnx(model_inputs)

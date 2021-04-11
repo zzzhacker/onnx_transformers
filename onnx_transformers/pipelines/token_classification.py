@@ -1,7 +1,7 @@
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import numpy as np
-
+from pathlib import Path
 from transformers.file_utils import add_end_docstrings, is_tf_available, is_torch_available
 from transformers.modelcard import ModelCard
 from transformers.models.bert.tokenization_bert import BasicTokenizer
@@ -86,6 +86,8 @@ class TokenClassificationPipeline(Pipeline):
         task: str = "",
         grouped_entities: bool = False,
         ignore_subwords: bool = False,
+        onnx: bool = True,
+        graph_path: Optional[Path] = None,
     ):
         super().__init__(
             model=model,
@@ -95,6 +97,8 @@ class TokenClassificationPipeline(Pipeline):
             device=device,
             binary_output=binary_output,
             task=task,
+            onnx=onnx,
+            graph_path=graph_path
         )
 
         self.check_model_type(

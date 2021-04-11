@@ -1,5 +1,5 @@
 from typing import TYPE_CHECKING, Optional, Union
-
+from pathlib import Path
 from transformers.modelcard import ModelCard
 from transformers.tokenization_utils import PreTrainedTokenizer
 from .base import ArgumentHandler, Pipeline
@@ -57,6 +57,8 @@ class FeatureExtractionPipeline(Pipeline):
         args_parser: ArgumentHandler = None,
         device: int = -1,
         task: str = "",
+        onnx: bool = True,
+        graph_path: Optional[Path] = None,
     ):
         super().__init__(
             model=model,
@@ -67,6 +69,8 @@ class FeatureExtractionPipeline(Pipeline):
             device=device,
             binary_output=True,
             task=task,
+            onnx=onnx,
+            graph_path=graph_path
         )
 
     def __call__(self, *args, **kwargs):
@@ -79,4 +83,7 @@ class FeatureExtractionPipeline(Pipeline):
         Return:
             A nested list of :obj:`float`: The features computed by the model.
         """
-        return super().__call__(*args, **kwargs).tolist()
+        output =  super().__call__(*args, **kwargs)
+        if self.onnx:
+            return output[0]
+        return output
