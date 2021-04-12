@@ -2,7 +2,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-
+from pathlib import Path
 from transformers.data import SquadExample, SquadFeatures, squad_convert_examples_to_features
 from transformers.file_utils import PaddingStrategy, add_end_docstrings, is_tf_available, is_torch_available
 from transformers.modelcard import ModelCard
@@ -118,6 +118,8 @@ class QuestionAnsweringPipeline(Pipeline):
         framework: Optional[str] = None,
         device: int = -1,
         task: str = "",
+        onnx: bool = True,
+        graph_path: Optional[Path] = None,
         **kwargs
     ):
         super().__init__(
@@ -127,13 +129,16 @@ class QuestionAnsweringPipeline(Pipeline):
             framework=framework,
             device=device,
             task=task,
+            onnx=onnx,
+            graph_path=graph_path,
             **kwargs,
         )
 
         self._args_parser = QuestionAnsweringArgumentHandler()
-        self.check_model_type(
-            TF_MODEL_FOR_QUESTION_ANSWERING_MAPPING if self.framework == "tf" else MODEL_FOR_QUESTION_ANSWERING_MAPPING
-        )
+        if not onnx:
+            self.check_model_type(
+                TF_MODEL_FOR_QUESTION_ANSWERING_MAPPING if self.framework == "tf" else MODEL_FOR_QUESTION_ANSWERING_MAPPING
+            )
 
     @staticmethod
     def create_sample(
@@ -302,21 +307,24 @@ class QuestionAnsweringPipeline(Pipeline):
         for features, example in zip(features_list, examples):
             model_input_names = self.tokenizer.model_input_names
             fw_args = {k: [feature.__dict__[k] for feature in features] for k in model_input_names}
-
-            # Manage tensor allocation on correct device
-            with self.device_placement():
-                if self.framework == "tf":
-                    fw_args = {k: tf.constant(v) for (k, v) in fw_args.items()}
-                    start, end = self.model(fw_args)[:2]
-                    start, end = start.numpy(), end.numpy()
-                else:
-                    with torch.no_grad():
-                        # Retrieve the score for the context tokens only (removing question tokens)
-                        fw_args = {k: torch.tensor(v, device=self.device) for (k, v) in fw_args.items()}
-                        # On Windows, the default int type in numpy is np.int32 so we get some non-long tensors.
-                        fw_args = {k: v.long() if v.dtype == torch.int32 else v for (k, v) in fw_args.items()}
-                        start, end = self.model(**fw_args)[:2]
-                        start, end = start.cpu().numpy(), end.cpu().numpy()
+            if self.onnx:
+                fw_args = {k: np.array(v) for (k, v) in fw_args.items()}
+                start, end = self._forward_onnx(fw_args)[:2]
+            else:
+                # Manage tensor allocation on correct device
+                with self.device_placement():
+                    if self.framework == "tf":
+                        fw_args = {k: tf.constant(v) for (k, v) in fw_args.items()}
+                        start, end = self.model(fw_args)[:2]
+                        start, end = start.numpy(), end.numpy()
+                    else:
+                        with torch.no_grad():
+                            # Retrieve the score for the context tokens only (removing question tokens)
+                            fw_args = {k: torch.tensor(v, device=self.device) for (k, v) in fw_args.items()}
+                            # On Windows, the default int type in numpy is np.int32 so we get some non-long tensors.
+                            fw_args = {k: v.long() if v.dtype == torch.int32 else v for (k, v) in fw_args.items()}
+                            start, end = self.model(**fw_args)[:2]
+                            start, end = start.cpu().numpy(), end.cpu().numpy()
 
             min_null_score = 1000000  # large and positive
             answers = []
