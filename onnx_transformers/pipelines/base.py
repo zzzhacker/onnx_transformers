@@ -35,7 +35,6 @@ from transformers.utils import logging
 
 if is_tf_available():
     import tensorflow as tf
-
     from transformers.models.auto.modeling_tf_auto import TFAutoModel
 
 if is_torch_available():
@@ -664,8 +663,7 @@ class Pipeline(_ScikitCompat):
         """
         if not isinstance(supported_models, list):  # Create from a model mapping
             supported_models = [item[1].__name__ for item in supported_models.items()]
-        print(self.model.__class__.__name__)
-        print(supported_models)
+        
         if self.model.__class__.__name__ not in supported_models:
             raise PipelineException(
                 self.task,

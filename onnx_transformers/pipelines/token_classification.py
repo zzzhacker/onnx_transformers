@@ -6,6 +6,7 @@ from transformers.file_utils import add_end_docstrings, is_tf_available, is_torc
 from transformers.modelcard import ModelCard
 from transformers.models.bert.tokenization_bert import BasicTokenizer
 from transformers.tokenization_utils import PreTrainedTokenizer
+from transformers.configuration_utils import PretrainedConfig
 from .base import PIPELINE_INIT_ARGS, ArgumentHandler, Pipeline
 
 
@@ -77,6 +78,7 @@ class TokenClassificationPipeline(Pipeline):
         self,
         model: Union["PreTrainedModel", "TFPreTrainedModel"],
         tokenizer: PreTrainedTokenizer,
+        config : PretrainedConfig,
         modelcard: Optional[ModelCard] = None,
         framework: Optional[str] = None,
         args_parser: ArgumentHandler = TokenClassificationArgumentHandler(),
@@ -92,6 +94,7 @@ class TokenClassificationPipeline(Pipeline):
         super().__init__(
             model=model,
             tokenizer=tokenizer,
+            config = config,
             modelcard=modelcard,
             framework=framework,
             device=device,
@@ -100,12 +103,12 @@ class TokenClassificationPipeline(Pipeline):
             onnx=onnx,
             graph_path=graph_path
         )
-
-        self.check_model_type(
-            TF_MODEL_FOR_TOKEN_CLASSIFICATION_MAPPING
-            if self.framework == "tf"
-            else MODEL_FOR_TOKEN_CLASSIFICATION_MAPPING
-        )
+        if not onnx:
+            self.check_model_type(
+                TF_MODEL_FOR_TOKEN_CLASSIFICATION_MAPPING
+                if self.framework == "tf"
+                else MODEL_FOR_TOKEN_CLASSIFICATION_MAPPING
+            )
 
         self._basic_tokenizer = BasicTokenizer(do_lower_case=False)
         self._args_parser = args_parser
@@ -149,36 +152,55 @@ class TokenClassificationPipeline(Pipeline):
         answers = []
 
         for i, sentence in enumerate(_inputs):
-
-            # Manage correct placement of the tensors
-            with self.device_placement():
-
+            if self.onnx:
                 tokens = self.tokenizer(
                     sentence,
-                    return_attention_mask=False,
+                    return_attention_mask=True,
                     return_tensors=self.framework,
                     truncation=True,
                     return_special_tokens_mask=True,
                     return_offsets_mapping=self.tokenizer.is_fast,
                 )
                 if self.tokenizer.is_fast:
-                    offset_mapping = tokens.pop("offset_mapping").cpu().numpy()[0]
+                    offset_mapping = tokens.pop("offset_mapping")[0]
                 elif offset_mappings:
                     offset_mapping = offset_mappings[i]
                 else:
                     offset_mapping = None
 
-                special_tokens_mask = tokens.pop("special_tokens_mask").cpu().numpy()[0]
+                special_tokens_mask = tokens.pop("special_tokens_mask")[0]
+                entities = self._forward_onnx(tokens)[0]
+                entities = entities.squeeze(0)
+                input_ids = tokens["input_ids"][0]
+            else:
+                # Manage correct placement of the tensors
+                with self.device_placement():
+                    tokens = self.tokenizer(
+                        sentence,
+                        return_attention_mask=False,
+                        return_tensors=self.framework,
+                        truncation=True,
+                        return_special_tokens_mask=True,
+                        return_offsets_mapping=self.tokenizer.is_fast,
+                    )
+                    if self.tokenizer.is_fast:
+                        offset_mapping = tokens.pop("offset_mapping").cpu().numpy()[0]
+                    elif offset_mappings:
+                        offset_mapping = offset_mappings[i]
+                    else:
+                        offset_mapping = None
 
-                # Forward
-                if self.framework == "tf":
-                    entities = self.model(tokens.data)[0][0].numpy()
-                    input_ids = tokens["input_ids"].numpy()[0]
-                else:
-                    with torch.no_grad():
-                        tokens = self.ensure_tensor_on_device(**tokens)
-                        entities = self.model(**tokens)[0][0].cpu().numpy()
-                        input_ids = tokens["input_ids"].cpu().numpy()[0]
+                    special_tokens_mask = tokens.pop("special_tokens_mask").cpu().numpy()[0]
+
+                    # Forward
+                    if self.framework == "tf":
+                        entities = self.model(tokens.data)[0][0].numpy()
+                        input_ids = tokens["input_ids"].numpy()[0]
+                    else:
+                        with torch.no_grad():
+                            tokens = self.ensure_tensor_on_device(**tokens)
+                            entities = self.model(**tokens)[0][0].cpu().numpy()
+                            input_ids = tokens["input_ids"].cpu().numpy()[0]
 
             score = np.exp(entities) / np.exp(entities).sum(-1, keepdims=True)
             labels_idx = score.argmax(axis=-1)
@@ -189,7 +211,7 @@ class TokenClassificationPipeline(Pipeline):
             filtered_labels_idx = [
                 (idx, label_idx)
                 for idx, label_idx in enumerate(labels_idx)
-                if (self.model.config.id2label[label_idx] not in self.ignore_labels) and not special_tokens_mask[idx]
+                if (self.config.id2label[label_idx] not in self.ignore_labels) and not special_tokens_mask[idx]
             ]
 
             for idx, label_idx in filtered_labels_idx:
@@ -211,7 +233,7 @@ class TokenClassificationPipeline(Pipeline):
                 entity = {
                     "word": word,
                     "score": score[idx][label_idx].item(),
-                    "entity": self.model.config.id2label[label_idx],
+                    "entity": self.config.id2label[label_idx],
                     "index": idx,
                     "start": start_ind,
                     "end": end_ind,

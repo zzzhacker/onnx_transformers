@@ -62,7 +62,7 @@ class TextClassificationPipeline(Pipeline):
 
             If ``self.return_all_scores=True``, one such dictionary is returned per label.
         """
-        outputs = super().__call__(*args, **kwargs)a
+        outputs = super().__call__(*args, **kwargs)
 
         if self.config.num_labels == 1:
             scores = 1.0 / (1.0 + np.exp(-outputs))
