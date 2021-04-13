@@ -93,7 +93,7 @@ if TYPE_CHECKING:
     from transformers.modeling_tf_utils import TFPreTrainedModel
     from transformers.modeling_utils import PreTrainedModel
 
-ONNX_CACHE_DIR = Path(os.path.dirname(__file__)).parent.joinpath(".onnx")
+
 
 logger = logging.get_logger(__name__)
 
@@ -257,6 +257,7 @@ def pipeline(
     tokenizer: Optional[Union[str, PreTrainedTokenizer]] = None,
     framework: Optional[str] = None,
     revision: Optional[str] = None,
+    onnx_model_dir : Optional[str] = None,
     use_fast: bool = True,
     model_kwargs: Dict[str, Any] = {},
     onnx: bool = True,
@@ -381,7 +382,13 @@ def pipeline(
     elif config is None:
         config = AutoConfig.from_pretrained(model,revision=revision, _from_pipeline=task)
 
-    graph_name = f"{os.path.basename(model)}.onnx"
+    if onnx_model_dir:
+        ONNX_CACHE_DIR = Path(onnx_model_dir)
+    else:
+        ONNX_CACHE_DIR = Path(os.path.dirname(__file__)).parent.joinpath(".onnx")
+
+
+    graph_name = f"{os.path.basename(model)}_{task}.onnx"
     graph_path = ONNX_CACHE_DIR.joinpath(model, graph_name)
 
     # Infer the framework form the model

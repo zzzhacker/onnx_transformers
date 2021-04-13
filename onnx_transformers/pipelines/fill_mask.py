@@ -1,10 +1,11 @@
 from typing import TYPE_CHECKING, Optional, Union
 
 import numpy as np
-
+from pathlib import Path
 from transformers.file_utils import add_end_docstrings, is_tf_available, is_torch_available
 from transformers.modelcard import ModelCard
 from transformers.tokenization_utils import PreTrainedTokenizer
+from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 from .base import PIPELINE_INIT_ARGS, ArgumentHandler, Pipeline, PipelineException
 
@@ -52,27 +53,33 @@ class FillMaskPipeline(Pipeline):
 
     def __init__(
         self,
-        model: Union["PreTrainedModel", "TFPreTrainedModel"],
+        model: Union["PreTrainedModel", "TFPreTrainedModel",str],
         tokenizer: PreTrainedTokenizer,
+        config : PretrainedConfig,
         modelcard: Optional[ModelCard] = None,
         framework: Optional[str] = None,
         args_parser: ArgumentHandler = None,
         device: int = -1,
         top_k=5,
         task: str = "",
+        onnx: bool = True,
+        graph_path: Optional[Path] = None,
     ):
         super().__init__(
             model=model,
             tokenizer=tokenizer,
+            config=config,
             modelcard=modelcard,
             framework=framework,
             args_parser=args_parser,
             device=device,
             binary_output=True,
             task=task,
+            onnx=onnx,
+            graph_path=graph_path
         )
-
-        self.check_model_type(TF_MODEL_WITH_LM_HEAD_MAPPING if self.framework == "tf" else MODEL_FOR_MASKED_LM_MAPPING)
+        if not onnx:
+            self.check_model_type(TF_MODEL_WITH_LM_HEAD_MAPPING if self.framework == "tf" else MODEL_FOR_MASKED_LM_MAPPING)
         self.top_k = top_k
 
     def ensure_exactly_one_mask_token(self, masked_index: np.ndarray):
@@ -80,13 +87,13 @@ class FillMaskPipeline(Pipeline):
         if numel > 1:
             raise PipelineException(
                 "fill-mask",
-                self.model.base_model_prefix,
+                self.model.base_model_prefix if not self.onnx else model,
                 f"More than one mask_token ({self.tokenizer.mask_token}) is not supported",
             )
         elif numel < 1:
             raise PipelineException(
                 "fill-mask",
-                self.model.base_model_prefix,
+                self.model.base_model_prefix if not self.onnx else model,
                 f"No mask_token ({self.tokenizer.mask_token}) found on the input",
             )
 
@@ -113,7 +120,18 @@ class FillMaskPipeline(Pipeline):
             - **token** (:obj:`str`) -- The predicted token (to replace the masked one).
         """
         inputs = self._parse_and_tokenize(*args, **kwargs)
-        outputs = self._forward(inputs, return_tensors=True)
+        print(type(inputs))
+        print(type(inputs["input_ids"]))
+        if self.onnx:
+            outputs = self._forward_onnx(inputs)[0]
+            if self.framework == "tf":
+                outputs = tf.covert_to_tensor(outputs,dtype=str(outputs.dtype))
+                inputs['input_ids'] = tf.covert_to_tensor(inputs['input_ids'],dtype=str(inputs['input_ids'].dtype))
+            else:
+                outputs = torch.from_numpy(outputs)
+                inputs['input_ids'] = torch.from_numpy(inputs['input_ids'])
+        else:
+            outputs = self._forward(inputs, return_tensors=True)
 
         results = []
         batch_size = outputs.shape[0] if self.framework == "tf" else outputs.size(0)

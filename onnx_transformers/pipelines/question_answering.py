@@ -112,7 +112,7 @@ class QuestionAnsweringPipeline(Pipeline):
 
     def __init__(
         self,
-        model: Union["PreTrainedModel", "TFPreTrainedModel"],
+        model: Union["PreTrainedModel", "TFPreTrainedModel",str],
         tokenizer: PreTrainedTokenizer,
         modelcard: Optional[ModelCard] = None,
         framework: Optional[str] = None,
